@@ -1,3 +1,17 @@
+0.9.2 (2026-10-28)
+    * Renamed the distribution to "pip2pi-dev"; libpip2pi and the dir2pi,
+      pip2pi and pip2tgz commands keep their names.
+    * Replaced setup.py with a PEP 621 pyproject.toml, dropped pkg_resources,
+      and require Python 3.11+.
+    * dir2pi scans only the top level of PACKAGE_DIR; the new --recursive
+      switch also indexes archives in sub-directories at any depth.
+    * New repeatable --exclude-dir PATTERN leaves directories out of the
+      --recursive scan, e.g. --exclude-dir nightly. A pattern without '/'
+      matches a directory name at any depth, one with '/' the path below
+      PACKAGE_DIR.
+    * dir2pi titles package pages with "<h1>Links for <package></h1>" and
+      sorts simple/index.html by name.
+
 0.8.2 (2021-08-04)
     * Changed cgi.escape to html.escape. Fixes wolever#96.
       (https://github.com/wolever/pip2pi/pull/106; thanks @BraulioV)
