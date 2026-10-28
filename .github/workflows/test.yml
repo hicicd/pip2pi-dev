@@ -1,0 +1,42 @@
+# Runs the test suite on every push and pull request.
+#
+# The wheel build and the PyPI publishing live in publish.yml.
+
+name: test
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.12"
+          - "3.13"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install pip and wheel
+        run: python -m pip install --upgrade pip wheel
+      - name: Run the test suite
+        run: ./run-tests

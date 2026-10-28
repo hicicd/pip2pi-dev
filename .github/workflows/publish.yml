@@ -1,0 +1,131 @@
+# Builds the wheel with uv and publishes it to PyPI.
+#
+#   "v*" tag push : build the wheel, then publish it to PyPI
+#   manual run    : build the wheel, then publish it to PyPI, to TestPyPI, or
+#                   not at all (the wheel is still available as an artifact)
+#
+# The tests are a separate workflow (test.yml) and this one does not wait for
+# them, so only tag a commit whose tests are green.
+#
+# Publishing needs credentials, either
+#   * trusted publishing (recommended, no secrets): on PyPI, add a trusted
+#     publisher for repository hicicd/pip2pi-dev, workflow "publish.yml", and
+#     the environment "pypi";
+#   * or API tokens: add a PYPI_API_TOKEN secret (and TEST_PYPI_API_TOKEN for
+#     TestPyPI).
+
+name: publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Where to publish the wheel
+        type: choice
+        options:
+          - nothing
+          - testpypi
+          - pypi
+        default: nothing
+
+permissions:
+  contents: read
+
+concurrency:
+  # No cancel-in-progress: interrupting an upload would leave a broken release.
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Check that the tag matches libpip2pi.__version__
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(python3 -c 'import libpip2pi; print(".".join(map(str, libpip2pi.__version__)))')"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match libpip2pi.__version__ = $version"
+            exit 1
+          fi
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Smoke test the built wheel
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/smoke"
+          uv pip install --python "$RUNNER_TEMP/smoke/bin/python" dist/*.whl
+          for command in dir2pi pip2pi pip2tgz; do
+            "$RUNNER_TEMP/smoke/bin/$command" --help > /dev/null
+          done
+          mkdir -p "$RUNNER_TEMP/pkg"
+          cp dist/*.whl "$RUNNER_TEMP/pkg/"
+          "$RUNNER_TEMP/smoke/bin/dir2pi" "$RUNNER_TEMP/pkg"
+          # the wheel name is <distribution>-<version>-...whl and dir2pi turns
+          # "pip2pi_dev" into the package directory "pip2pi-dev"
+          wheel="$(basename dist/*.whl)"
+          package="$(printf '%s' "${wheel%%-*}" | tr '_' '-')"
+          test -f "$RUNNER_TEMP/pkg/simple/$package/index.html"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs:
+      - build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish != 'nothing'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Publish
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+          TEST_PYPI_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          REQUESTED_TARGET: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            target=pypi
+          else
+            target="${REQUESTED_TARGET:-nothing}"
+          fi
+          echo "publishing to $target"
+          case "$target" in
+            pypi)
+              args=()
+              if [ -n "${PYPI_TOKEN:-}" ]; then
+                args+=(--token "$PYPI_TOKEN")
+              fi
+              uv publish "${args[@]}" dist/*.whl
+              ;;
+            testpypi)
+              args=(--publish-url https://test.pypi.org/legacy/)
+              if [ -n "${TEST_PYPI_TOKEN:-}" ]; then
+                args+=(--token "$TEST_PYPI_TOKEN")
+              fi
+              uv publish "${args[@]}" dist/*.whl
+              ;;
+            *)
+              echo "::error::unknown publish target: $target"
+              exit 1
+              ;;
+          esac
