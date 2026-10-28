@@ -6,9 +6,9 @@ import atexit
 import tempfile
 import warnings
 import textwrap
+import fnmatch
 import functools
 from subprocess import check_call
-import pkg_resources
 import glob
 import optparse
 
@@ -30,58 +30,8 @@ def try_int(x):
     except ValueError:
         return x
 
-
-try:
-    pip_pkg_info = pkg_resources.get_distribution('pip')
-    pip_version = tuple(try_int(x) for x in pip_pkg_info.version.split("."))
-    has_pip = True
-except ImportError:
-    pip_version = None
-    has_pip = False
-    pip_download_command = ''
-    pip_no_binary_command = ''
-
-
-if pip_version:
-    if pip_version >= (10, 0, 0):
-        from pip._internal import main as pip_main
-        pip_download_command = 'download --dest'
-        pip_no_binary_command = '--no-binary=:all:'
-    elif pip_version >= (8, 0, 0):
-        from pip import main as pip_main
-        pip_download_command = 'download --dest'
-        pip_no_binary_command = '--no-binary=:all:'
-    elif pip_version >= (7, 0, 0):
-        from pip import main as pip_main
-        pip_download_command = 'install --download'
-        pip_no_binary_command = '--no-binary=:all:'
-    else:
-        from pip import main as pip_main
-        pip_download_command = 'install --download'
-        pip_no_binary_command = '--no-use-wheel'
-
-class PipError(Exception):
-    pass
-
-def warn_wheel():
-    print(
-        "ERROR: .whl packages were downloaded but the wheel package "
-        "is not installed, so they cannot be correctly processed.\n"
-        "Install it with:\n"
-        "    pip install wheel"
-    )
-    try:
-        import setuptools
-        setuptools_version = setuptools.__version__
-    except ImportError:
-        setuptools_version = ''
-    if setuptools_version < '1.0.0':
-        print(
-            "WARNING: your setuptools package is out of date. This "
-            "could lead to bad things.\n"
-            "You should likely update it:\n"
-            "    pip install -U setuptools"
-        )
+pip_download_command = 'download --dest'
+pip_no_binary_command = '--no-binary=:all:'
 
 def dedent(text):
     return textwrap.dedent(text.lstrip("\n")).rstrip()
@@ -105,10 +55,38 @@ class InvalidFilePackageName(ValueError):
         msg += ")"
         super(InvalidFilePackageName, self).__init__(msg)
 
-def egg_to_package(file):
-    warnings.warn("egg_to_package is deprecated; use file_to_package.",
-                  stacklevel=1)
-    return file_to_package(file)
+
+def safe_name(name):
+    """Convert an arbitrary string to a standard distribution name
+
+    Any runs of non-alphanumeric/. characters are replaced with a single '-'.
+    Copied from pkg_resources.
+    """
+    return re.sub('[^A-Za-z0-9.]+', '-', name)
+
+# Copied from pkg_resources.
+EGG_NAME = re.compile(
+    r"""
+    (?P<name>[^-]+) (
+        -(?P<ver>[^-]+) (
+            -py(?P<pyver>[^-]+) (
+                -(?P<plat>.+)
+            )?
+        )?
+    )?
+    """,
+    re.VERBOSE | re.IGNORECASE,
+).match
+
+
+def egg_project_name(filename):
+    project_name, version, py_version, platform = [None] * 4
+    basename, ext = os.path.splitext(filename)
+    match = EGG_NAME(basename)
+    if match:
+        project_name = match.group("name")
+    return safe_name(project_name or 'Unknown')
+
 
 def file_to_package(file, basedir=None):
     """ Returns the package name for a given file, or raises an
@@ -143,23 +121,22 @@ def file_to_package(file, basedir=None):
     file = os.path.basename(file)
     file_ext = os.path.splitext(file)[1].lower()
     if file_ext == ".egg":
-        dist = pkg_resources.Distribution.from_location(None, file)
-        name = dist.project_name
+        name = egg_project_name(file)
         split = (name, file[len(name)+1:])
         to_safe_name = lambda x: x
         to_safe_rest = lambda x: x
     elif file_ext == ".whl":
         bits = file.rsplit("-", 4)
         split = (bits[0], "-".join(bits[1:]))
-        to_safe_name = pkg_resources.safe_name
+        to_safe_name = safe_name
         to_safe_rest = lambda x: x
     else:
         match = re.search(r"(?P<pkg>.*?)-(?P<rest>\d+.*)", file)
         if not match:
             raise InvalidFilePackageName(file, basedir)
         split = (match.group("pkg"), match.group("rest"))
-        to_safe_name = pkg_resources.safe_name
-        to_safe_rest = pkg_resources.safe_name
+        to_safe_name = safe_name
+        to_safe_rest = safe_name
 
     if len(split) != 2 or not split[1]:
         raise InvalidFilePackageName(file, basedir)
@@ -168,28 +145,7 @@ def file_to_package(file, basedir=None):
 
 
 def pip_run_command(pip_args):
-    if not has_pip:
-        print("===== WARNING =====")
-        print("Cannot `import pip` - falling back to the pip executable.")
-        print("This will be deprecated in a future release.")
-        print("Please open an issue if this will be a problem: "
-              "https://github.com/wolever/pip2pi/issues")
-        print("===================")
-        check_call(["pip"] + pip_args)
-        return
-
-    if pip_version < (1, 1):
-        raise RuntimeError("pip >= 1.1 required, but %s is installed"
-                           %(pip_version, ))
-    # TODO: Remove this once
-    # pip._internal.req.req_tracker.RequirementTracker.cleanup() does it
-    # already.
-    os.environ.pop('PIP_REQ_TRACKER', None)
-    res = pip_main(pip_args)
-    if res != 0:
-        raise PipError("pip failed with status %s while running: %s"
-                       %(res, pip_args))
-
+    check_call(["pip"] + pip_args)
 
 OS_HAS_SYMLINK = hasattr(os, "symlink")
 
@@ -220,6 +176,28 @@ class Pip2PiOptionParser(optparse.OptionParser):
                 will be used: "spam-eggs-cheese-shop" (PEP-503),
                 "spam-eggs-cheese.shop" (pip 6, pip 7),
                 "Spam_Eggs--cheese.shop" (pip < 6)).
+            """))
+        self.add_option(
+            '--recursive', dest="recursive", default=False,
+            action="store_true",
+            help=dedent("""
+                Also scan sub-directories of PACKAGE_DIR, at any depth, for
+                packages. Not enabled by default: without this option only the
+                top level of PACKAGE_DIR is scanned. Files in sub-directories
+                are only indexed when their name ends in one of: .whl, .egg,
+                .zip, .tgz, .tar, .tar.gz, .tar.bz2, .tar.xz.
+            """))
+        self.add_option(
+            '--exclude-dir', dest="exclude_dirs", metavar="PATTERN",
+            action="append", default=None,
+            help=dedent("""
+                Skip any directory whose path below PACKAGE_DIR matches the
+                shell-style glob PATTERN (case sensitive; '*' may match '/'
+                too). A PATTERN without '/' matches a directory name at any
+                depth, so --exclude-dir nightly skips both PACKAGE_DIR/nightly
+                and PACKAGE_DIR/foo/nightly, while --exclude-dir
+                'nightly/20260923' skips one nightly build. May be given more
+                than once. Only has an effect with --recursive.
             """))
         self.add_option(
             '-x', '--no-build-html', dest="build_html", action="store_false",
@@ -274,7 +252,8 @@ def dir2pi(argv=sys.argv, use_symlink=None):
             Creates the directory PACKAGE_DIR/simple/ and populates it with the
             directory structure required to use with pip's --index-url.
 
-            Assumes that PACKAGE_DIR contains a bunch of archives named
+            Assumes that PACKAGE_DIR (and, with --recursive, its
+            sub-directories) contain a bunch of archives named
             'package-name-version.ext' (ex 'foo-2.1.tar.gz' or
             'foo-bar-1.3rc1.bz2').
 
@@ -334,31 +313,146 @@ def try_symlink(option, source, target):
         )
 
 
+# Files in sub-directories are only treated as packages when their name looks
+# like a package archive: a directory full of downloads often also holds a
+# README, an index.html, etc. The top level keeps the historical behaviour of
+# treating every file it finds as a package.
+PACKAGE_FILE_EXTS = (
+    ".whl", ".egg", ".zip", ".tgz", ".tar", ".tar.gz", ".tar.bz2", ".tar.xz",
+)
+
+def is_package_file(filename):
+    return filename.lower().endswith(PACKAGE_FILE_EXTS)
+
+
+def normalize_exclude_patterns(patterns):
+    """ Normalizes the values of --exclude-dir to 'a/b' form, without slashes
+        at either end: 'nightly/', '/nightly' and 'nightly' are the same
+        pattern.
+    """
+    result = []
+    for raw in patterns or ():
+        pattern = raw.replace("\\", "/").strip().strip("/")
+        if not pattern:
+            raise ValueError("empty --exclude-dir pattern: %r" %(raw, ))
+        result.append(pattern)
+    return tuple(result)
+
+
+def is_excluded_dir(relpath, patterns):
+    """ Tells whether the directory at ``relpath`` (relative to PACKAGE_DIR)
+        is excluded by one of ``patterns``.
+
+        Patterns are shell-style globs matched, case sensitively, against the
+        relative path with '/' as the separator. A pattern without a '/' is
+        matched against the name of the directory only, at any depth.
+    """
+    relpath = relpath.replace(os.sep, "/")
+    dirname = relpath.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        if "/" in pattern:
+            if fnmatch.fnmatchcase(relpath, pattern):
+                return True
+        elif fnmatch.fnmatchcase(dirname, pattern):
+            return True
+    return False
+
+
+def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=()):
+    """ Yields the packages to index, depth first.
+
+        The top level of ``pkgdir`` is always scanned. Sub-directories are
+        scanned too when ``recursive`` is true (it is not by default), but only
+        files that look like a package archive are taken from them. Hidden
+        files and directories are ignored, and so is anything in ``skip_dirs``
+        (absolute paths -- the generated ``simple`` directory) or matching one
+        of the ``exclude_dirs`` patterns (see ``is_excluded_dir``).
+    """
+    skip_dirs = set(os.path.abspath(x) for x in skip_dirs)
+    exclude_dirs = tuple(exclude_dirs or ())
+
+    def keep(dirpath, dirname):
+        if dirname.startswith("."):
+            return False
+        subdirpath = os.path.join(dirpath, dirname)
+        if os.path.abspath(subdirpath) in skip_dirs:
+            return False
+        return not is_excluded_dir(
+            os.path.relpath(subdirpath, pkgdir), exclude_dirs,
+        )
+
+    if not recursive:
+        for filename in sorted(os.listdir(pkgdir)):
+            filepath = os.path.join(pkgdir, filename)
+            if not filename.startswith(".") and os.path.isfile(filepath):
+                yield filepath
+        return
+
+    for dirpath, dirnames, filenames in os.walk(pkgdir):
+        at_top = os.path.abspath(dirpath) == os.path.abspath(pkgdir)
+        dirnames[:] = sorted(
+            dirname for dirname in dirnames if keep(dirpath, dirname)
+        )
+        for filename in sorted(filenames):
+            if filename.startswith("."):
+                continue
+            if not at_top and not is_package_file(filename):
+                continue
+            filepath = os.path.join(dirpath, filename)
+            if os.path.isfile(filepath):
+                yield filepath
+
+
 def _dir2pi(option, argv):
     pkgdir = argv[1]
     if not os.path.isdir(pkgdir):
         raise ValueError("no such directory: %r" %(pkgdir, ))
     pkgdirpath = lambda *x: os.path.join(pkgdir, *x)
+    exclude_dirs = normalize_exclude_patterns(option.exclude_dirs)
 
     shutil.rmtree(pkgdirpath("simple"), ignore_errors=True)
     os.mkdir(pkgdirpath("simple"))
     pkg_index = ("<html><head><title>Simple Index</title>"
                  "<meta name='api-version' value='2' /></head><body>\n")
 
-    processed_pkg = set()
-    for file in os.listdir(pkgdir):
-        pkg_filepath = os.path.join(pkgdir, file)
-        if not os.path.isfile(pkg_filepath):
-            continue
-        pkg_basename = os.path.basename(file)
-        if pkg_basename.startswith("."):
-            continue
-        pkg_name, pkg_rest = file_to_package(pkg_basename, pkgdir)
+    # The same archive can be present more than once -- nightly builds keep a
+    # directory per build -- and only one of them is indexed: the last one in
+    # lexicographic order, so the newest build directory wins.
+    pkg_files = {}
+    for pkg_filepath in iter_package_files(
+        pkgdir,
+        recursive=option.recursive,
+        skip_dirs=[pkgdirpath("simple")],
+        exclude_dirs=exclude_dirs,
+    ):
+        pkg_basename = os.path.basename(pkg_filepath)
+        pkg_name, pkg_rest = file_to_package(
+            pkg_basename, os.path.dirname(pkg_filepath),
+        )
 
         pkg_dir_name = pkg_name
         if option.normalize_package_names:
             pkg_dir_name = normalize_pep503(pkg_dir_name)
 
+        pkg_key = (pkg_dir_name, pkg_basename)
+        previous = pkg_files.get(pkg_key)
+        if previous is None or (
+            os.path.normpath(pkg_filepath) > os.path.normpath(previous[0])
+        ):
+            if previous is not None and option.verbose:
+                print('replacing duplicate %s with %s' %(
+                    previous[0], pkg_filepath,
+                ))
+            pkg_files[pkg_key] = (pkg_filepath, pkg_name)
+        elif option.verbose:
+            print('ignoring duplicate %s (keeping %s)' %(
+                pkg_filepath, previous[0],
+            ))
+
+    processed_pkg = set()
+    written_pkg_pages = set()
+    index_links = []
+    for (pkg_dir_name, pkg_basename), (pkg_filepath, pkg_name) in pkg_files.items():
         pkg_dir = pkgdirpath("simple", pkg_dir_name)
         if not os.path.exists(pkg_dir):
             os.mkdir(pkg_dir)
@@ -368,7 +462,7 @@ def _dir2pi(option, argv):
             try_symlink(option, pkg_dir_name, pkgdirpath("simple", pkg_name))
 
         symlink_target = os.path.join(pkg_dir, pkg_basename)
-        symlink_source = os.path.join("../../", pkg_basename)
+        symlink_source = os.path.relpath(pkg_filepath, pkg_dir)
         if option.use_symlink:
             try_symlink(option, symlink_source, symlink_target)
         else:
@@ -377,22 +471,46 @@ def _dir2pi(option, argv):
             shutil.copy2(pkg_filepath, symlink_target)
 
         if pkg_name not in processed_pkg:
-            pkg_index += "<a href='%s/'>%s</a><br />\n" %(
-                escape(pkg_dir_name),
-                escape(pkg_name),
-            )
+            index_links.append((pkg_dir_name, pkg_name))
             processed_pkg.add(pkg_name)
 
         if option.build_html:
-            with open(os.path.join(pkg_dir, "index.html"), "a") as fp:
+            pkg_page = os.path.join(pkg_dir, "index.html")
+            if pkg_page not in written_pkg_pages:
+                with open(pkg_page, "w") as fp:
+                    fp.write(
+                        "<html><head><title>Links for %(name)s</title>"
+                        "<meta name='api-version' value='2' />"
+                        "</head><body>\n"
+                        "<h1>Links for %(name)s</h1>\n" %{
+                            "name": escape(pkg_name),
+                        }
+                    )
+                written_pkg_pages.add(pkg_page)
+            with open(pkg_page, "a") as fp:
                 fp.write("<a href='%(name)s'>%(name)s</a><br />\n" %{
                     "name": escape(pkg_basename),
                 })
+    # The order in which the archives are found depends on the filesystem (and
+    # on the directory they live in), so the index is sorted here rather than
+    # relying on the order of the scan: alphabetically, ignoring case.
+    pkg_index += "".join(
+        "<a href='%(dir)s/'>%(name)s</a><br />\n" %{
+            "dir": escape(pkg_dir_name),
+            "name": escape(pkg_name),
+        }
+        for pkg_dir_name, pkg_name in sorted(
+            index_links, key=lambda link: (link[1].lower(), link[1]),
+        )
+    )
     pkg_index += "</body></html>\n"
 
     if option.build_html:
         with open(pkgdirpath("simple/index.html"), "w") as fp:
             fp.write(pkg_index)
+        for pkg_page in written_pkg_pages:
+            with open(pkg_page, "a") as fp:
+                fp.write("</body></html>\n")
 
     return 0
 
@@ -439,66 +557,14 @@ def pip2tgz(argv=sys.argv):
     pkg_file_set = lambda: set(globall(full_glob_paths))
     old_pkgs = pkg_file_set()
 
-    if pip_version >= (8, 0, 0):
-        pip_run_command(pip_download_command.split() + [outdir] + argv[2:])
-    else:
-        pip_run_command(pip_download_command.split() + [outdir] + argv[2:])
+    pip_run_command(pip_download_command.split() + [outdir] + argv[2:])
 
     os.chdir(outdir)
     new_pkgs = pkg_file_set() - old_pkgs
-    new_wheels = [ f for f in new_pkgs if f.endswith(".whl") ]
-    res = handle_new_wheels(outdir, new_wheels)
-    if res:
-        return res
-
     num_pkgs = len(pkg_file_set() - old_pkgs)
     print("\nDone. %s new archives currently saved in %r." %(num_pkgs, argv[1]))
     return 0
 
-
-def handle_new_wheels(outdir, new_wheels):
-    """ Makes sure that, if wheel files are downloaded, their dependencies are
-        correctly handled.
-
-        This is necessary because ``pip install -d ...`` was broken
-        pre-1.5.3[0].
-
-        [0]: https://github.com/pypa/pip/issues/1617
-        """
-    if not new_wheels:
-        return 0
-
-    if pip_version >= (1, 5, 3):
-        return 0
-
-    print("")
-    print("!" * 80)
-
-    if not has_wheel:
-        warn_wheel()
-        # Remove the wheel files so that they will be re-downloaded and
-        # their dependencies installed next time around
-        for f in new_wheels:
-            os.unlink(f)
-        return 1
-
-    print(dedent("""
-        WARNING: Your version of pip (%s) doesn't correctly support wheel
-        files. I'll do my best to work around that for now, but if possible
-        you should upgrade to at least 1.5.3.
-    """)) %(pip_version, )
-
-    print("!" * 80)
-    print
-
-    for new_pkg in new_wheels:
-        pkg_file_basedir = os.path.abspath(os.path.dirname(new_pkg))
-        pkg_name, _ = file_to_package(new_pkg)
-        pip_run_command([
-            '-q', 'wheel', '-w', outdir,
-            '--find-links', pkg_file_basedir,
-            pkg_name,
-        ])
 
 WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:\\")
 

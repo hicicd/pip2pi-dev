@@ -1,9 +1,6 @@
 ``pip2pi`` builds a PyPI-compatible package repository from ``pip`` requirements
 ================================================================================
 
-.. image:: https://travis-ci.org/wolever/pip2pi.png?branch=master
-    :target: https://travis-ci.org/wolever/pip2pi
-
 PyPI can go down, package maintainers can remove old tarballs, and downloading
 tarballs can take a long time. ``pip2pi`` helps to alleviate these problems by
 making it blindingly simple to maintain a PyPI-compatible repository of packages
@@ -44,17 +41,19 @@ your software depends on.
 Requirements
 ------------
 
-0. ``pip``
-1. A ``requirements.txt`` file for your project (optional, but useful)
-2. An HTTP server (optional, but useful)
+0. Python 3.11 or newer
+1. ``pip``
+2. A ``requirements.txt`` file for your project (optional, but useful)
+3. An HTTP server (optional, but useful)
 
 
 Setup
 -----
 
-Install ``pip2pi``::
+Install ``pip2pi-dev`` (the ``dir2pi``, ``pip2pi`` and ``pip2tgz`` commands keep
+their names)::
 
-    $ pip install pip2pi
+    $ pip install pip2pi-dev
 
 And create the directory which will contain the tarballs of required packages,
 preferably somewhere under your web server's document root::
@@ -111,6 +110,38 @@ A directory full of ``.tar.gz`` files can be turned into PyPI-compatible
     packages/simple/baz/baz-0.3.tar.gz
     packages/simple/foo
     packages/simple/foo/foo-1.2.tar.gz
+
+The archives do not have to sit at the top level of ``packages/``: with
+``--recursive``, every sub-directory is scanned too, and only files named like
+a package archive (``.whl``, ``.egg``, ``.zip``, ``.tgz``, ``.tar``,
+``.tar.gz``, ``.tar.bz2``, ``.tar.xz``) are picked up from them. Without it --
+the default, and the behaviour of older releases -- only the top level of
+``packages/`` is scanned::
+
+    $ find packages/ -name '*.whl'
+    packages/flask/flask-3.1.3-py3-none-any.whl
+    packages/click/v8.5.0/click-8.5.0-py3-none-any.whl
+    $ dir2pi --recursive packages/
+
+If the same archive (same file name) is present in more than one place -- as
+happens with nightly builds, kept in a directory per build -- it is indexed
+once, using the last one in lexicographic order.
+
+Directories can be left out of the scan with ``--exclude-dir``, which takes a
+shell-style glob matched, case sensitively, against the path below
+``packages/``. A pattern without a ``/`` matches a directory name at any
+depth, so the nightly builds can be kept out of the index::
+
+    $ dir2pi --recursive --exclude-dir nightly packages/
+
+The option may be given more than once, and a pattern containing ``/`` is
+matched against the whole relative path, so a single night's builds can be
+skipped without touching the others::
+
+    $ dir2pi --recursive --exclude-dir 'nightly/20260923' packages/
+
+``--exclude-dir`` only matters together with ``--recursive``, which is what
+makes dir2pi look inside sub-directories at all.
 
 
 But that's a lot of work...
@@ -182,6 +213,31 @@ index in your Windows, Linux, or Mac file system::
     
 Note the triple ``///`` after ``file:`` -- two for the protocol,
 the third for the root of the local file system.
+
+
+Building and releasing
+----------------------
+
+The wheel is built with `uv <https://docs.astral.sh/uv/>`_. Locally::
+
+    $ uv build --wheel
+    $ ls dist/
+    dist/pip2pi_dev-0.9.2-py3-none-any.whl
+
+Two GitHub Actions workflows share the work: ``.github/workflows/test.yml`` runs
+the test suite on every push and pull request, and
+``.github/workflows/publish.yml`` builds the wheel with uv and publishes it to
+PyPI when a version tag is pushed::
+
+    $ git tag v0.9.2
+    $ git push origin v0.9.2
+
+The tag must match ``libpip2pi.__version__``. A manual run of ``publish.yml``
+can publish to TestPyPI (or to PyPI) without tagging, or just build the wheel.
+The two workflows are independent, so only tag a commit whose tests are green.
+Publishing uses trusted publishing when it is configured for this repository on
+PyPI (workflow ``publish.yml``, environment ``pypi``), otherwise the
+``PYPI_API_TOKEN`` secret (``TEST_PYPI_API_TOKEN`` for TestPyPI).
 
 
 Keywords

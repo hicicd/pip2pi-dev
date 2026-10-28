@@ -105,6 +105,17 @@ class Pip2PiRequestHandler(SimpleHTTPRequestHandler):
 IS_CASE_INSENSITIVE = os.path.exists(__file__.upper())
 OS_HAS_SYMLINK = hasattr(os, "symlink")
 
+# Some tests download sdists with pip from the fixture index in assets/. Recent
+# pip versions prepare the metadata of an sdist before downloading it, so that
+# index would also have to serve the sdist's build requirements (setuptools),
+# which it does not. They are opt-in instead.
+HEAVY_TESTS = os.environ.get("PIP2PI_HEAVY_TESTS") == "1"
+needs_heavy_tests = unittest.skipUnless(
+    HEAVY_TESTS,
+    "downloads an sdist from the fixture index, which modern pip cannot build "
+    "(set PIP2PI_HEAVY_TESTS=1 to run it)",
+)
+
 class Pip2PiHeavyTests(unittest.TestCase):
     SERVER_PORT = random.randint(10000, 40000)
 
@@ -200,6 +211,7 @@ class Pip2PiHeavyTests(unittest.TestCase):
         print("Running %s with: %s" %(cmd, args))
         return getattr(pip2pi_commands, cmd)([cmd] + args)
 
+    @needs_heavy_tests
     def test_requirements_txt(self):
         res = self.exc("pip2pi", [
             self.temp_dir,
@@ -209,6 +221,7 @@ class Pip2PiHeavyTests(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertDirContents("test_requirements_txt/expected-normal.txt", self.temp_dir)
 
+    @needs_heavy_tests
     def test_requirements_txt_with_aggressive_normalization(self):
         res = self.exc("pip2pi", [
             self.temp_dir,
@@ -225,6 +238,220 @@ class Pip2PiHeavyTests(unittest.TestCase):
         self.exc("dir2pi", [self.temp_dir])
         self.assertDirContents("expected-eggs-in-packages.txt", self.temp_dir)
 
+    def test_package_index_links_heading(self):
+        for asset in ("six-1.10.0-py2.py3-none-any.whl", "six-1.10.0.tar.gz"):
+            shutil.copy(os.path.join("assets", asset), self.temp_dir)
+        res = self.exc("dir2pi", [self.temp_dir])
+        self.assertEqual(res, 0)
+        with open(os.path.join(self.temp_dir, "simple", "six", "index.html")) as fp:
+            page = fp.read()
+        self.assertTrue(
+            page.startswith(
+                "<html><head><title>Links for six</title>"
+                "<meta name='api-version' value='2' /></head><body>\n"
+                "<h1>Links for six</h1>\n"
+            ),
+            page,
+        )
+        self.assertEqual(page.count("<h1>Links for six</h1>"), 1, page)
+        self.assertTrue(page.endswith("</body></html>\n"), page)
+        self.assertIn("<a href='six-1.10.0-py2.py3-none-any.whl'>", page)
+        self.assertIn("<a href='six-1.10.0.tar.gz'>", page)
+
+    def test_recursive_scan_of_subdirectories(self):
+        os.makedirs(os.path.join(self.temp_dir, "flask"))
+        os.makedirs(os.path.join(self.temp_dir, "click", "v8.5.0"))
+        os.makedirs(os.path.join(self.temp_dir, ".cache"))
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl",
+                    os.path.join(self.temp_dir, "flask"))
+        shutil.copy("assets/wheel-0.29.0-py2.py3-none-any.whl",
+                    os.path.join(self.temp_dir, "click", "v8.5.0"))
+        shutil.copy("assets/Normalization_Test.with-dashes-1.2rc3.zip",
+                    self.temp_dir)
+        shutil.copy("assets/six-1.10.0.tar.gz",
+                    os.path.join(self.temp_dir, ".cache"))
+        with open(os.path.join(self.temp_dir, "flask", "README.txt"), "w") as fp:
+            fp.write("not a package\n")
+
+        res = self.exc("dir2pi", ["-S", "--recursive", self.temp_dir])
+        self.assertEqual(res, 0)
+
+        simple = os.path.join(self.temp_dir, "simple")
+        self.assertEqual(
+            sorted(os.listdir(simple)),
+            ["index.html", "normalization-test-with-dashes", "six", "wheel"],
+        )
+        # six lives in flask/, its hidden .cache/ copy is not picked up
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(simple, "six"))),
+            ["index.html", "six-1.10.0-py2.py3-none-any.whl"],
+        )
+        # wheel lives two levels down, in click/v8.5.0/
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(simple, "wheel"))),
+            ["index.html", "wheel-0.29.0-py2.py3-none-any.whl"],
+        )
+        with open(os.path.join(simple, "six", "index.html")) as fp:
+            page = fp.read()
+        self.assertIn("<a href='six-1.10.0-py2.py3-none-any.whl'>", page)
+
+        # the generated simple/ directory is never re-scanned, so running
+        # dir2pi again produces the same index
+        res = self.exc("dir2pi", ["-S", "--recursive", self.temp_dir])
+        self.assertEqual(res, 0)
+        with open(os.path.join(simple, "six", "index.html")) as fp:
+            self.assertEqual(fp.read(), page)
+
+    def test_top_level_only_by_default(self):
+        os.makedirs(os.path.join(self.temp_dir, "flask"))
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl",
+                    os.path.join(self.temp_dir, "flask"))
+        shutil.copy("assets/Normalization_Test.with-dashes-1.2rc3.zip",
+                    self.temp_dir)
+
+        res = self.exc("dir2pi", ["-S", self.temp_dir])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "normalization-test-with-dashes"],
+        )
+
+    def test_simple_index_is_sorted_by_package_name(self):
+        for asset in ("wheel-0.29.0-py2.py3-none-any.whl",
+                      "six-1.10.0-py2.py3-none-any.whl",
+                      "Normalization_Test.with-dashes-1.2rc3.zip",
+                      "fish-1.1.tar.gz"):
+            shutil.copy(os.path.join("assets", asset), self.temp_dir)
+
+        res = self.exc("dir2pi", ["-S", self.temp_dir])
+        self.assertEqual(res, 0)
+        with open(os.path.join(self.temp_dir, "simple", "index.html")) as fp:
+            self.assertEqual(fp.read(), (
+                "<html><head><title>Simple Index</title>"
+                "<meta name='api-version' value='2' /></head><body>\n"
+                "<a href='fish/'>fish</a><br />\n"
+                "<a href='normalization-test-with-dashes/'>"
+                "Normalization-Test.with-dashes</a><br />\n"
+                "<a href='six/'>six</a><br />\n"
+                "<a href='wheel/'>wheel</a><br />\n"
+                "</body></html>\n"
+            ))
+
+    def test_duplicate_package_files_keep_the_last_one(self):
+        # nightly builds keep a directory per build, so the same file name shows
+        # up several times; the last one in lexicographic order must win.
+        builds = (
+            ("20260919", "main_20260919001013_c37ac1ab"),
+            ("20260920", "main_20260920001015_c37ac1ab"),
+            ("20260920", "main_20260920201628_0ca324ce"),
+            ("20260923", "main_20260923001012_2060b5da"),
+            ("20260923", "main_20260923191512_67cb1ed7"),
+        )
+        for day, build in builds:
+            build_dir = os.path.join(self.temp_dir, "nightly", day, build)
+            os.makedirs(build_dir)
+            filename = ("datagallery_dataagent-0.2.0.dev%s-py3-none-any.whl"
+                        % (day, ))
+            with open(os.path.join(build_dir, filename), "w") as fp:
+                fp.write(build)
+
+        res = self.exc("dir2pi", ["-S", "--recursive", self.temp_dir])
+        self.assertEqual(res, 0)
+
+        simple = os.path.join(self.temp_dir, "simple", "datagallery-dataagent")
+        self.assertEqual(sorted(os.listdir(simple)), [
+            "datagallery_dataagent-0.2.0.dev20260919-py3-none-any.whl",
+            "datagallery_dataagent-0.2.0.dev20260920-py3-none-any.whl",
+            "datagallery_dataagent-0.2.0.dev20260923-py3-none-any.whl",
+            "index.html",
+        ])
+        for filename, winner in (
+            ("datagallery_dataagent-0.2.0.dev20260919-py3-none-any.whl",
+             "main_20260919001013_c37ac1ab"),
+            ("datagallery_dataagent-0.2.0.dev20260920-py3-none-any.whl",
+             "main_20260920201628_0ca324ce"),
+            ("datagallery_dataagent-0.2.0.dev20260923-py3-none-any.whl",
+             "main_20260923191512_67cb1ed7"),
+        ):
+            with open(os.path.join(simple, filename)) as fp:
+                self.assertEqual(fp.read(), winner)
+
+    def test_exclude_dir_nightly(self):
+        build_dir = os.path.join(
+            self.temp_dir,
+            "nightly", "20260923", "main_20260923191512_67cb1ed7",
+        )
+        os.makedirs(build_dir)
+        build_file = os.path.join(build_dir, "night-0.1-py3-none-any.whl")
+        with open(build_file, "w") as fp:
+            fp.write("nightly build\n")
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", self.temp_dir)
+
+        res = self.exc("dir2pi", [
+            "-S", "--recursive", "--exclude-dir", "nightly", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "six"],
+        )
+
+    def test_exclude_dir_matches_nested_directories(self):
+        nightly = os.path.join(self.temp_dir, "foo", "nightly")
+        release = os.path.join(self.temp_dir, "foo", "release")
+        for path in (nightly, release):
+            os.makedirs(path)
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", nightly)
+        shutil.copy("assets/wheel-0.29.0-py2.py3-none-any.whl", release)
+
+        res = self.exc("dir2pi", [
+            "-S", "--recursive", "--exclude-dir", "nightly", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "wheel"],
+        )
+
+    def test_exclude_dir_with_path_pattern(self):
+        for day in ("20260919", "20260920"):
+            build_dir = os.path.join(self.temp_dir, "nightly", day, "build")
+            os.makedirs(build_dir)
+            filename = "night-0.1.dev%s-py3-none-any.whl" % (day, )
+            with open(os.path.join(build_dir, filename), "w") as fp:
+                fp.write(day)
+
+        res = self.exc("dir2pi", [
+            "-S", "--recursive", "--exclude-dir", "nightly/20260920",
+            self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple", "night"))),
+            ["index.html", "night-0.1.dev20260919-py3-none-any.whl"],
+        )
+
+    def test_exclude_dir_may_be_given_more_than_once(self):
+        for dirname, asset in (
+            ("nightly", "six-1.10.0-py2.py3-none-any.whl"),
+            ("old", "wheel-0.29.0-py2.py3-none-any.whl"),
+        ):
+            os.makedirs(os.path.join(self.temp_dir, dirname))
+            shutil.copy(os.path.join("assets", asset),
+                        os.path.join(self.temp_dir, dirname))
+        shutil.copy("assets/Normalization_Test.with-dashes-1.2rc3.zip",
+                    self.temp_dir)
+
+        res = self.exc("dir2pi", [
+            "-S", "--recursive", "--exclude-dir", "nightly",
+            "--exclude-dir", "old", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "normalization-test-with-dashes"],
+        )
+
     def test_wheels(self):
         res = self.exc("pip2tgz", [
             self.temp_dir,
@@ -234,6 +461,7 @@ class Pip2PiHeavyTests(unittest.TestCase):
         self.assertEqual(res, 0)
         self.assertDirContents('expected-test_wheels.txt', self.temp_dir)
 
+    @needs_heavy_tests
     def test_get_source_with_wheels(self):
         res = self.exc("pip2pi", [
             self.temp_dir,
@@ -266,6 +494,72 @@ class TestIsRemoteTarget(unittest.TestCase):
         for target in self.local_targets:
             assert not pip2pi_commands.is_remote_target(target), \
                     "%r is local" %(target, )
+
+
+class TestExcludeDirPatterns(unittest.TestCase):
+    def test_pattern_without_separator_matches_at_any_depth(self):
+        patterns = ("nightly", )
+        self.assertTrue(pip2pi_commands.is_excluded_dir("nightly", patterns))
+        self.assertTrue(
+            pip2pi_commands.is_excluded_dir("foo/nightly", patterns))
+        self.assertTrue(
+            pip2pi_commands.is_excluded_dir("a/b/nightly", patterns))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_dir("nightly2", patterns))
+        self.assertFalse(pip2pi_commands.is_excluded_dir("foo", patterns))
+
+    def test_pattern_with_separator_matches_the_relative_path(self):
+        patterns = ("nightly/20260923", )
+        self.assertTrue(
+            pip2pi_commands.is_excluded_dir("nightly/20260923", patterns))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_dir("nightly/20260924", patterns))
+        # a path pattern is not a prefix: the nightly directory itself is kept
+        self.assertFalse(
+            pip2pi_commands.is_excluded_dir("nightly", patterns))
+
+    def test_patterns_are_case_sensitive(self):
+        self.assertFalse(
+            pip2pi_commands.is_excluded_dir("Nightly", ("nightly", )))
+
+    def test_normalize(self):
+        self.assertEqual(
+            pip2pi_commands.normalize_exclude_patterns(
+                ["nightly/", "/nightly", "nightly\\build"],
+            ),
+            ("nightly", "nightly", "nightly/build"),
+        )
+        self.assertEqual(
+            pip2pi_commands.normalize_exclude_patterns(None), ())
+        with self.assertRaises(ValueError):
+            pip2pi_commands.normalize_exclude_patterns(["/"])
+
+    def test_iter_package_files_honours_exclude_dirs(self):
+        temp_dir = tempfile.mkdtemp(prefix="pip2pi-tests")
+        self.addCleanup(shutil.rmtree, temp_dir)
+        build_dir = os.path.join(temp_dir, "nightly", "build")
+        os.makedirs(build_dir)
+        for filepath in (
+            os.path.join(build_dir, "night-0.1-py3-none-any.whl"),
+            os.path.join(temp_dir, "six-1.10.0-py2.py3-none-any.whl"),
+        ):
+            with open(filepath, "w") as fp:
+                fp.write("not a real wheel\n")
+
+        def found(**kwargs):
+            return sorted(
+                os.path.basename(path) for path in
+                pip2pi_commands.iter_package_files(temp_dir, **kwargs)
+            )
+
+        # only the top level is scanned unless recursive is asked for
+        self.assertEqual(found(), ["six-1.10.0-py2.py3-none-any.whl"])
+        self.assertEqual(found(recursive=True), [
+            "night-0.1-py3-none-any.whl", "six-1.10.0-py2.py3-none-any.whl",
+        ])
+        self.assertEqual(found(recursive=True, exclude_dirs=("nightly", )), [
+            "six-1.10.0-py2.py3-none-any.whl",
+        ])
 
 
 def load_tests(loader, tests, ignore):
