@@ -143,6 +143,24 @@ skipped without touching the others::
 ``--exclude-dir`` only matters together with ``--recursive``, which is what
 makes dir2pi look inside sub-directories at all.
 
+Files are left out of the scan with ``--exclude-file``, which takes the same
+kind of shell-style glob and may also be given more than once. This is for the
+non-package files that tend to live next to the archives, the ones that would
+otherwise stop dir2pi with ``unexpected file name: 'index.html'``::
+
+    $ dir2pi --recursive --exclude-file index.html --exclude-file pypi.lock \
+        packages/
+
+A pattern without a ``/`` matches a file name at any depth; one containing
+``/`` is matched against the whole path below ``packages/``, so
+``--exclude-file 'nightly/20260923/index.html'`` skips a single build's page.
+Only files that would otherwise be scanned are affected: hidden files, and
+files in sub-directories that do not look like a package archive, are already
+skipped. Unlike ``--exclude-dir``, ``--exclude-file`` also matters without
+``--recursive``, because the top level of ``packages/`` is always scanned.
+``--verbose`` lists every file that is skipped, and skipped files are only
+left out of the index -- they are never deleted or moved.
+
 
 But that's a lot of work...
 ---------------------------

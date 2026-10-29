@@ -200,6 +200,20 @@ class Pip2PiOptionParser(optparse.OptionParser):
                 than once. Only has an effect with --recursive.
             """))
         self.add_option(
+            '--exclude-file', dest="exclude_files", metavar="PATTERN",
+            action="append", default=None,
+            help=dedent("""
+                Skip any file whose path below PACKAGE_DIR matches the
+                shell-style glob PATTERN (case sensitive; '*' may match '/'
+                too). A PATTERN without '/' matches a file name at any depth,
+                so --exclude-file index.html skips both PACKAGE_DIR/index.html
+                and PACKAGE_DIR/foo/index.html, while --exclude-file
+                'foo/index.html' skips one of them. May be given more than
+                once. Unlike --exclude-dir, this option also applies without
+                --recursive, since the top level of PACKAGE_DIR is always
+                scanned.
+            """))
+        self.add_option(
             '-x', '--no-build-html', dest="build_html", action="store_false",
             default=True, help=dedent("""
                 Don't build index files for each directory, you might want to
@@ -339,26 +353,46 @@ def normalize_exclude_patterns(patterns):
     return tuple(result)
 
 
-def is_excluded_dir(relpath, patterns):
-    """ Tells whether the directory at ``relpath`` (relative to PACKAGE_DIR)
-        is excluded by one of ``patterns``.
+def is_excluded_path(relpath, patterns):
+    """ Tells whether the directory or file at ``relpath`` (relative to
+        PACKAGE_DIR) is excluded by one of ``patterns``.
 
         Patterns are shell-style globs matched, case sensitively, against the
         relative path with '/' as the separator. A pattern without a '/' is
-        matched against the name of the directory only, at any depth.
+        matched against the last path component (the directory or file name)
+        only, at any depth.
     """
     relpath = relpath.replace(os.sep, "/")
-    dirname = relpath.rsplit("/", 1)[-1]
+    name = relpath.rsplit("/", 1)[-1]
     for pattern in patterns:
         if "/" in pattern:
             if fnmatch.fnmatchcase(relpath, pattern):
                 return True
-        elif fnmatch.fnmatchcase(dirname, pattern):
+        elif fnmatch.fnmatchcase(name, pattern):
             return True
     return False
 
 
-def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=()):
+def is_excluded_dir(relpath, patterns):
+    """ Tells whether the directory at ``relpath`` (relative to PACKAGE_DIR)
+        is excluded by one of ``patterns``.
+
+        See ``is_excluded_path`` for the matching rules.
+    """
+    return is_excluded_path(relpath, patterns)
+
+
+def is_excluded_file(relpath, patterns):
+    """ Tells whether the file at ``relpath`` (relative to PACKAGE_DIR) is
+        excluded by one of ``patterns``.
+
+        See ``is_excluded_path`` for the matching rules.
+    """
+    return is_excluded_path(relpath, patterns)
+
+
+def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=(),
+                       exclude_files=(), verbose=False):
     """ Yields the packages to index, depth first.
 
         The top level of ``pkgdir`` is always scanned. Sub-directories are
@@ -366,10 +400,13 @@ def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=()):
         files that look like a package archive are taken from them. Hidden
         files and directories are ignored, and so is anything in ``skip_dirs``
         (absolute paths -- the generated ``simple`` directory) or matching one
-        of the ``exclude_dirs`` patterns (see ``is_excluded_dir``).
+        of the ``exclude_dirs`` / ``exclude_files`` patterns (see
+        ``is_excluded_path``). Skipped files are reported on stdout when
+        ``verbose`` is true.
     """
     skip_dirs = set(os.path.abspath(x) for x in skip_dirs)
     exclude_dirs = tuple(exclude_dirs or ())
+    exclude_files = tuple(exclude_files or ())
 
     def keep(dirpath, dirname):
         if dirname.startswith("."):
@@ -381,10 +418,20 @@ def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=()):
             os.path.relpath(subdirpath, pkgdir), exclude_dirs,
         )
 
+    def keep_file(dirpath, filename):
+        relpath = os.path.relpath(os.path.join(dirpath, filename), pkgdir)
+        if not is_excluded_file(relpath, exclude_files):
+            return True
+        if verbose:
+            print('excluding %s' %(relpath, ))
+        return False
+
     if not recursive:
         for filename in sorted(os.listdir(pkgdir)):
             filepath = os.path.join(pkgdir, filename)
-            if not filename.startswith(".") and os.path.isfile(filepath):
+            if filename.startswith(".") or not keep_file(pkgdir, filename):
+                continue
+            if os.path.isfile(filepath):
                 yield filepath
         return
 
@@ -398,6 +445,8 @@ def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=()):
                 continue
             if not at_top and not is_package_file(filename):
                 continue
+            if not keep_file(dirpath, filename):
+                continue
             filepath = os.path.join(dirpath, filename)
             if os.path.isfile(filepath):
                 yield filepath
@@ -409,6 +458,7 @@ def _dir2pi(option, argv):
         raise ValueError("no such directory: %r" %(pkgdir, ))
     pkgdirpath = lambda *x: os.path.join(pkgdir, *x)
     exclude_dirs = normalize_exclude_patterns(option.exclude_dirs)
+    exclude_files = normalize_exclude_patterns(option.exclude_files)
 
     shutil.rmtree(pkgdirpath("simple"), ignore_errors=True)
     os.mkdir(pkgdirpath("simple"))
@@ -424,6 +474,8 @@ def _dir2pi(option, argv):
         recursive=option.recursive,
         skip_dirs=[pkgdirpath("simple")],
         exclude_dirs=exclude_dirs,
+        exclude_files=exclude_files,
+        verbose=option.verbose,
     ):
         pkg_basename = os.path.basename(pkg_filepath)
         pkg_name, pkg_rest = file_to_package(

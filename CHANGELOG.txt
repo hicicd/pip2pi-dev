@@ -1,3 +1,7 @@
+0.9.3 (2026-10-29)
+    * New repeatable --exclude-file PATTERN skips files (e.g. index.html) when
+      building the index; same glob rules as --exclude-dir.
+
 0.9.2 (2026-10-28)
     * Renamed the distribution to "pip2pi-dev"; libpip2pi and the dir2pi,
       pip2pi and pip2tgz commands keep their names.

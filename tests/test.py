@@ -452,6 +452,80 @@ class Pip2PiHeavyTests(unittest.TestCase):
             ["index.html", "normalization-test-with-dashes"],
         )
 
+    def test_exclude_file_index_html_at_top_level(self):
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", self.temp_dir)
+        with open(os.path.join(self.temp_dir, "index.html"), "w") as fp:
+            fp.write("<html></html>\n")
+
+        # without the option an unexpected file name is still an error
+        with self.assertRaises(pip2pi_commands.InvalidFilePackageName):
+            self.exc("dir2pi", ["-S", self.temp_dir])
+
+        res = self.exc("dir2pi", [
+            "-S", "--exclude-file", "index.html", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "six"],
+        )
+
+    def test_exclude_file_may_be_given_more_than_once(self):
+        for asset in ("six-1.10.0-py2.py3-none-any.whl",
+                      "wheel-0.29.0-py2.py3-none-any.whl"):
+            shutil.copy(os.path.join("assets", asset), self.temp_dir)
+        for filename in ("index.html", "pypi.lock"):
+            with open(os.path.join(self.temp_dir, filename), "w") as fp:
+                fp.write("not a package\n")
+
+        res = self.exc("dir2pi", [
+            "-S", "--exclude-file", "index.html",
+            "--exclude-file", "pypi.lock", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "six", "wheel"],
+        )
+
+    def test_exclude_file_applies_without_recursive(self):
+        # --exclude-dir needs --recursive, --exclude-file does not: the top
+        # level is always scanned.
+        os.makedirs(os.path.join(self.temp_dir, "build"))
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", self.temp_dir)
+        for directory in (self.temp_dir, os.path.join(self.temp_dir, "build")):
+            with open(os.path.join(directory, "index.html"), "w") as fp:
+                fp.write("<html></html>\n")
+
+        res = self.exc("dir2pi", [
+            "-S", "--exclude-file", "index.html", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "six"],
+        )
+        # the file is only skipped, never deleted
+        self.assertTrue(
+            os.path.exists(os.path.join(self.temp_dir, "index.html")))
+
+    def test_exclude_file_glob(self):
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", self.temp_dir)
+        for filename in ("index.html", "pypi.lock", "six-1.10.0.tar.gz"):
+            with open(os.path.join(self.temp_dir, filename), "w") as fp:
+                fp.write("not a package\n")
+
+        res = self.exc("dir2pi", [
+            "-S", "--exclude-file", "*.html", "--exclude-file", "*.lock",
+            self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple", "six"))),
+            ["index.html", "six-1.10.0-py2.py3-none-any.whl",
+             "six-1.10.0.tar.gz"],
+        )
+
     def test_wheels(self):
         res = self.exc("pip2tgz", [
             self.temp_dir,
@@ -560,6 +634,93 @@ class TestExcludeDirPatterns(unittest.TestCase):
         self.assertEqual(found(recursive=True, exclude_dirs=("nightly", )), [
             "six-1.10.0-py2.py3-none-any.whl",
         ])
+
+
+class TestExcludeFilePatterns(unittest.TestCase):
+    def test_pattern_without_separator_matches_a_file_name_at_any_depth(self):
+        patterns = ("index.html", )
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("index.html", patterns))
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("foo/index.html", patterns))
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("a/b/index.html", patterns))
+        # not a prefix match
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("index.html.bak", patterns))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("foo", patterns))
+
+    def test_pattern_with_separator_matches_the_relative_path(self):
+        patterns = ("foo/index.html", )
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("foo/index.html", patterns))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("foo/bar/index.html", patterns))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("index.html", patterns))
+
+    def test_wildcards_match_file_names(self):
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("index.html", ("*.html", )))
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file("pypi.lock", ("*.lock", )))
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("pypi.lock", ("*.html", )))
+        # '*' may match '/' too, as for --exclude-dir
+        self.assertTrue(
+            pip2pi_commands.is_excluded_file(
+                "foo/bar/index.html", ("*/index.html", )))
+
+    def test_patterns_are_case_sensitive(self):
+        self.assertFalse(
+            pip2pi_commands.is_excluded_file("Index.html", ("index.html", )))
+
+    def test_iter_package_files_honours_exclude_files(self):
+        temp_dir = tempfile.mkdtemp(prefix="pip2pi-tests")
+        self.addCleanup(shutil.rmtree, temp_dir)
+        os.makedirs(os.path.join(temp_dir, "build"))
+        for filepath in (
+            os.path.join(temp_dir, "index.html"),
+            os.path.join(temp_dir, "build", "index.html"),
+            os.path.join(temp_dir, "six-1.10.0-py2.py3-none-any.whl"),
+        ):
+            with open(filepath, "w") as fp:
+                fp.write("not a real package\n")
+
+        def found(**kwargs):
+            return sorted(
+                os.path.basename(path) for path in
+                pip2pi_commands.iter_package_files(temp_dir, **kwargs)
+            )
+
+        # index.html in a sub-directory is filtered by extension anyway, but
+        # the top level file is only dropped when it is asked for
+        self.assertEqual(found(), [
+            "index.html", "six-1.10.0-py2.py3-none-any.whl",
+        ])
+        self.assertEqual(found(exclude_files=("index.html", )), [
+            "six-1.10.0-py2.py3-none-any.whl",
+        ])
+        self.assertEqual(
+            found(recursive=True, exclude_files=("index.html", )),
+            ["six-1.10.0-py2.py3-none-any.whl"],
+        )
+
+    def test_iter_package_files_reports_excluded_files_when_verbose(self):
+        import contextlib
+        import io
+        temp_dir = tempfile.mkdtemp(prefix="pip2pi-tests")
+        self.addCleanup(shutil.rmtree, temp_dir)
+        with open(os.path.join(temp_dir, "index.html"), "w") as fp:
+            fp.write("<html></html>\n")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            list(pip2pi_commands.iter_package_files(
+                temp_dir, exclude_files=("index.html", ), verbose=True,
+            ))
+        self.assertEqual(out.getvalue(), "excluding index.html\n")
 
 
 def load_tests(loader, tests, ignore):
