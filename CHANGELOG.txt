@@ -1,3 +1,7 @@
+0.9.4 (2026-10-30)
+    * dir2pi --recursive now follows symlinked directories (each real
+      directory is scanned once, so links back up the tree are ignored).
+
 0.9.3 (2026-10-29)
     * New repeatable --exclude-file PATTERN skips files (e.g. index.html) when
       building the index; same glob rules as --exclude-dir.

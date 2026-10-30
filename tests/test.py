@@ -105,6 +105,35 @@ class Pip2PiRequestHandler(SimpleHTTPRequestHandler):
 IS_CASE_INSENSITIVE = os.path.exists(__file__.upper())
 OS_HAS_SYMLINK = hasattr(os, "symlink")
 
+
+def symlink_unsupported_reason():
+    """ Returns why directory symlinks cannot be created here, or None.
+
+        ``OS_HAS_SYMLINK`` is not enough: on Windows a symlink can only be
+        created by an administrator (or with Developer Mode enabled), so the
+        few tests that need one are skipped there instead of failing.
+    """
+    if not OS_HAS_SYMLINK:
+        return "this platform has no os.symlink"
+    temp_dir = tempfile.mkdtemp(prefix="pip2pi-tests")
+    try:
+        target = os.path.join(temp_dir, "target")
+        os.mkdir(target)
+        try:
+            os.symlink(target, os.path.join(temp_dir, "link"),
+                       target_is_directory=True)
+        except (OSError, NotImplementedError) as e:
+            return "cannot create symlinks here: %s" %(e, )
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+SYMLINK_UNSUPPORTED = symlink_unsupported_reason()
+needs_symlinks = unittest.skipIf(
+    SYMLINK_UNSUPPORTED is not None, SYMLINK_UNSUPPORTED or "",
+)
+
 # Some tests download sdists with pip from the fixture index in assets/. Recent
 # pip versions prepare the metadata of an sdist before downloading it, so that
 # index would also have to serve the sdist's build requirements (setuptools),
@@ -314,6 +343,109 @@ class Pip2PiHeavyTests(unittest.TestCase):
         self.assertEqual(
             sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
             ["index.html", "normalization-test-with-dashes"],
+        )
+
+    @needs_symlinks
+    def test_recursive_scan_follows_symlinked_directories(self):
+        # packages are often kept outside PACKAGE_DIR and linked into it, so
+        # --recursive has to look inside a linked directory too
+        store = tempfile.mkdtemp(prefix="pip2pi-tests-store")
+        self.addCleanup(shutil.rmtree, store, ignore_errors=True)
+        build_dir = os.path.join(store, "flask", "v3.1.3")
+        os.makedirs(build_dir)
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", build_dir)
+        shutil.copy("assets/wheel-0.29.0-py2.py3-none-any.whl",
+                    self.temp_dir)
+        os.symlink(os.path.join(store, "flask"),
+                   os.path.join(self.temp_dir, "flask"),
+                   target_is_directory=True)
+
+        res = self.exc("dir2pi", ["-S", "--recursive", self.temp_dir])
+        self.assertEqual(res, 0)
+        simple = os.path.join(self.temp_dir, "simple")
+        self.assertEqual(
+            sorted(os.listdir(simple)), ["index.html", "six", "wheel"],
+        )
+        # six lives two levels down, in the linked flask/v3.1.3/
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(simple, "six"))),
+            ["index.html", "six-1.10.0-py2.py3-none-any.whl"],
+        )
+
+    @needs_symlinks
+    def test_recursive_scan_does_not_follow_a_link_back_up_the_tree(self):
+        # a link pointing at PACKAGE_DIR (or at itself) would otherwise make
+        # the scan run forever
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", self.temp_dir)
+        os.symlink(self.temp_dir, os.path.join(self.temp_dir, "loop"),
+                   target_is_directory=True)
+        os.symlink(os.curdir, os.path.join(self.temp_dir, "self"),
+                   target_is_directory=True)
+
+        res = self.exc("dir2pi", ["-S", "--recursive", self.temp_dir])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "six"],
+        )
+
+    @needs_symlinks
+    def test_symlinked_directories_are_not_scanned_without_recursive(self):
+        # without --recursive the top level is all that is indexed, and a link
+        # to a directory does not change that
+        os.makedirs(os.path.join(self.temp_dir, "flask"))
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl",
+                    os.path.join(self.temp_dir, "flask"))
+        os.symlink(os.path.join(self.temp_dir, "flask"),
+                   os.path.join(self.temp_dir, "linked-flask"),
+                   target_is_directory=True)
+        shutil.copy("assets/wheel-0.29.0-py2.py3-none-any.whl",
+                    self.temp_dir)
+
+        res = self.exc("dir2pi", ["-S", self.temp_dir])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html", "wheel"],
+        )
+
+    @needs_symlinks
+    def test_exclude_dir_applies_to_symlinked_directories(self):
+        store = tempfile.mkdtemp(prefix="pip2pi-tests-store")
+        self.addCleanup(shutil.rmtree, store, ignore_errors=True)
+        os.makedirs(os.path.join(store, "nightly"))
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl",
+                    os.path.join(store, "nightly"))
+        os.symlink(os.path.join(store, "nightly"),
+                   os.path.join(self.temp_dir, "nightly"),
+                   target_is_directory=True)
+
+        res = self.exc("dir2pi", [
+            "-S", "--recursive", "--exclude-dir", "nightly", self.temp_dir,
+        ])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple"))),
+            ["index.html"],
+        )
+
+    @needs_symlinks
+    def test_symlinked_package_files_are_indexed(self):
+        # a link to an archive is indexed like the archive itself, with or
+        # without --recursive
+        store = tempfile.mkdtemp(prefix="pip2pi-tests-store")
+        self.addCleanup(shutil.rmtree, store, ignore_errors=True)
+        target = os.path.join(store, "six-1.10.0-py2.py3-none-any.whl")
+        shutil.copy("assets/six-1.10.0-py2.py3-none-any.whl", target)
+        os.symlink(target, os.path.join(
+            self.temp_dir, "six-1.10.0-py2.py3-none-any.whl",
+        ))
+
+        res = self.exc("dir2pi", ["-S", self.temp_dir])
+        self.assertEqual(res, 0)
+        self.assertEqual(
+            sorted(os.listdir(os.path.join(self.temp_dir, "simple", "six"))),
+            ["index.html", "six-1.10.0-py2.py3-none-any.whl"],
         )
 
     def test_simple_index_is_sorted_by_package_name(self):

@@ -185,7 +185,9 @@ class Pip2PiOptionParser(optparse.OptionParser):
                 packages. Not enabled by default: without this option only the
                 top level of PACKAGE_DIR is scanned. Files in sub-directories
                 are only indexed when their name ends in one of: .whl, .egg,
-                .zip, .tgz, .tar, .tar.gz, .tar.bz2, .tar.xz.
+                .zip, .tgz, .tar, .tar.gz, .tar.bz2, .tar.xz. Symbolic links to
+                directories are followed, and each real directory is scanned
+                only once.
             """))
         self.add_option(
             '--exclude-dir', dest="exclude_dirs", metavar="PATTERN",
@@ -391,6 +393,17 @@ def is_excluded_file(relpath, patterns):
     return is_excluded_path(relpath, patterns)
 
 
+def _realpath(path):
+    """ Like ``os.path.realpath``, but never raises: a path that cannot be
+        resolved (a symlink loop, an unreadable reparse point...) is compared
+        as it is instead of stopping the scan.
+    """
+    try:
+        return os.path.realpath(path)
+    except OSError:
+        return os.path.abspath(path)
+
+
 def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=(),
                        exclude_files=(), verbose=False):
     """ Yields the packages to index, depth first.
@@ -401,22 +414,41 @@ def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=(),
         files and directories are ignored, and so is anything in ``skip_dirs``
         (absolute paths -- the generated ``simple`` directory) or matching one
         of the ``exclude_dirs`` / ``exclude_files`` patterns (see
-        ``is_excluded_path``). Skipped files are reported on stdout when
-        ``verbose`` is true.
+        ``is_excluded_path``). The recursive scan follows symbolic links to
+        directories, so archives kept outside ``pkgdir`` can be linked into it;
+        every real directory is scanned once, so a link pointing back up the
+        tree is ignored instead of being followed forever. Skipped files are
+        reported on stdout when ``verbose`` is true.
     """
     skip_dirs = set(os.path.abspath(x) for x in skip_dirs)
+    skip_real_dirs = set(_realpath(x) for x in skip_dirs)
     exclude_dirs = tuple(exclude_dirs or ())
     exclude_files = tuple(exclude_files or ())
 
-    def keep(dirpath, dirname):
+    def skip_reason(dirpath, dirname):
+        """ Why the directory ``dirname`` in ``dirpath`` is not scanned, or
+            None to scan it.
+
+            Hidden directories, and the generated ``simple`` directory, are
+            skipped silently: the empty string is returned for them, and only
+            directories the user excluded on purpose get a message.
+        """
         if dirname.startswith("."):
-            return False
+            return ""
         subdirpath = os.path.join(dirpath, dirname)
         if os.path.abspath(subdirpath) in skip_dirs:
-            return False
-        return not is_excluded_dir(
-            os.path.relpath(subdirpath, pkgdir), exclude_dirs,
-        )
+            return ""
+        if _realpath(subdirpath) in skip_real_dirs:
+            return ""
+        if is_excluded_dir(os.path.relpath(subdirpath, pkgdir), exclude_dirs):
+            return "excluded by --exclude-dir"
+        return None
+
+    def report_skipped_dir(dirpath, reason):
+        if verbose:
+            print('excluding %s (%s)' %(
+                os.path.relpath(dirpath, pkgdir), reason,
+            ))
 
     def keep_file(dirpath, filename):
         relpath = os.path.relpath(os.path.join(dirpath, filename), pkgdir)
@@ -435,21 +467,50 @@ def iter_package_files(pkgdir, recursive=False, skip_dirs=(), exclude_dirs=(),
                 yield filepath
         return
 
-    for dirpath, dirnames, filenames in os.walk(pkgdir):
-        at_top = os.path.abspath(dirpath) == os.path.abspath(pkgdir)
-        dirnames[:] = sorted(
-            dirname for dirname in dirnames if keep(dirpath, dirname)
-        )
-        for filename in sorted(filenames):
-            if filename.startswith("."):
+    # The recursive scan is a depth first walk, in the same order as os.walk's,
+    # except that it also follows symbolic links to directories: archives are
+    # often kept outside PACKAGE_DIR and linked into it. Following links means
+    # a link can point back up the tree -- at PACKAGE_DIR itself, at a parent,
+    # or at the generated simple directory -- so a real directory is only
+    # scanned the first time it is reached, its path being remembered in
+    # seen_dirs.
+    seen_dirs = set([_realpath(pkgdir)])
+    pending_dirs = [(pkgdir, True)]
+    while pending_dirs:
+        dirpath, at_top = pending_dirs.pop()
+        try:
+            names = sorted(os.listdir(dirpath))
+        except OSError as e:
+            report_skipped_dir(dirpath, e)
+            continue
+        subdirs = []
+        for name in names:
+            filepath = os.path.join(dirpath, name)
+            # isdir follows links, so a link to a directory is descended into
+            # exactly like a directory is
+            if os.path.isdir(filepath):
+                skip = skip_reason(dirpath, name)
+                if skip is not None:
+                    if skip:
+                        report_skipped_dir(filepath, skip)
+                    continue
+                realpath = _realpath(filepath)
+                if realpath in seen_dirs:
+                    report_skipped_dir(filepath, "already scanned as %s"
+                                       %(realpath, ))
+                    continue
+                seen_dirs.add(realpath)
+                subdirs.append(filepath)
                 continue
-            if not at_top and not is_package_file(filename):
+            if name.startswith("."):
                 continue
-            if not keep_file(dirpath, filename):
+            if not at_top and not is_package_file(name):
                 continue
-            filepath = os.path.join(dirpath, filename)
+            if not keep_file(dirpath, name):
+                continue
             if os.path.isfile(filepath):
                 yield filepath
+        pending_dirs.extend((subdir, False) for subdir in reversed(subdirs))
 
 
 def _dir2pi(option, argv):

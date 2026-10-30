@@ -123,6 +123,17 @@ the default, and the behaviour of older releases -- only the top level of
     packages/click/v8.5.0/click-8.5.0-py3-none-any.whl
     $ dir2pi --recursive packages/
 
+Symbolic links to directories are followed by the recursive scan, so archives
+kept somewhere else -- on another disk, in a shared directory -- can simply be
+linked into ``packages/``. Every real directory is scanned once, so a link
+pointing back up the tree (or at the generated ``packages/simple``) is ignored
+instead of being followed forever::
+
+    $ ln -s /srv/wheels/flask packages/flask
+    $ find packages/ -name '*.whl'
+    packages/flask/flask-3.1.3-py3-none-any.whl
+    $ dir2pi --recursive packages/
+
 If the same archive (same file name) is present in more than one place -- as
 happens with nightly builds, kept in a directory per build -- it is indexed
 once, using the last one in lexicographic order.
